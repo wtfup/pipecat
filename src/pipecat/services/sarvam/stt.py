@@ -833,6 +833,13 @@ class SarvamSTTService(STTService):
                 if transcript and transcript.strip():
                     # Record tracing for this transcription event
                     await self._handle_transcription(transcript, True, language)
+                    # Sarvam's WS emits exactly one `data` message per
+                    # utterance (after server-side VAD flush). That message
+                    # IS the terminal final transcript, so we mark the frame
+                    # finalized=True. This lets
+                    # SpeechTimeoutUserTurnStopStrategy short-circuit its
+                    # stt_timeout safety net (and, when enabled, the
+                    # short-utterance policy-floor short-circuit too).
                     await self.push_frame(
                         TranscriptionFrame(
                             transcript,
@@ -840,6 +847,7 @@ class SarvamSTTService(STTService):
                             time_now_iso8601(),
                             language,
                             result=(message.dict() if hasattr(message, "dict") else str(message)),
+                            finalized=True,
                         )
                     )
 

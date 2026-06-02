@@ -535,9 +535,18 @@ class TestSpeechTimeoutUserTurnStopStrategy(unittest.IsolatedAsyncioTestCase):
         user_speech_timeout still runs to completion as a policy floor,
         but stt_timeout is skipped once STT says it's done. Net effect:
         the turn stops at user_speech_timeout, not stt_timeout.
+
+        Note: v1.5 added a short-utterance policy-floor short-circuit
+        (default threshold = 20 chars). This test pins the ORIGINAL
+        stt-wait behavior, so we disable the new short-circuit by setting
+        ``short_utterance_char_threshold=0``. The v1.5 short-circuit has
+        its own dedicated test in test_speech_timeout_short_utterance.py.
         """
         stt_timeout = AGGREGATION_TIMEOUT * 4
-        strategy = SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=AGGREGATION_TIMEOUT)
+        strategy = SpeechTimeoutUserTurnStopStrategy(
+            user_speech_timeout=AGGREGATION_TIMEOUT,
+            short_utterance_char_threshold=0,
+        )
         await strategy.setup(self.task_manager)
         await strategy.process_frame(
             STTMetadataFrame(service_name="test", ttfs_p99_latency=stt_timeout)

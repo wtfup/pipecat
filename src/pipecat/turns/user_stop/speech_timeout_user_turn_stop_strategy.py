@@ -45,16 +45,35 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
     transcript — so the stt wait is marked done immediately.
     """
 
-    def __init__(self, *, user_speech_timeout: float = 0.6, **kwargs):
+    #: Default character threshold for the short-utterance short-circuit.
+    SHORT_UTTERANCE_CHAR_THRESHOLD: int = 20
+
+    def __init__(
+        self,
+        *,
+        user_speech_timeout: float = 0.6,
+        short_utterance_char_threshold: int = SHORT_UTTERANCE_CHAR_THRESHOLD,
+        **kwargs,
+    ):
         """Initialize the speech timeout-based user turn stop strategy.
 
         Args:
             user_speech_timeout: Time to wait for the user to potentially
                 say more after they pause speaking. Defaults to 0.6 seconds.
+            short_utterance_char_threshold: When a TranscriptionFrame with
+                ``finalized=True`` arrives and the accumulated text length
+                is <= this threshold, the ``user_speech_timeout`` policy
+                floor is short-circuited so the user turn fires
+                immediately. This shaves the perceived turn-around latency
+                for short utterances ("ok", "yes", "haan ji") without
+                changing behavior for longer ones. Set to ``0`` to disable
+                the short-circuit. Defaults to
+                :attr:`SHORT_UTTERANCE_CHAR_THRESHOLD`.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(**kwargs)
         self._user_speech_timeout = user_speech_timeout
+        self._short_utterance_char_threshold = short_utterance_char_threshold
         self._stt_timeout: float = 0.0  # STT P99 latency from STTMetadataFrame
         self._stop_secs: float = 0.0  # VAD stop_secs from VADUserStoppedSpeakingFrame
         self._stop_secs_warned: bool = False
@@ -186,6 +205,21 @@ class SpeechTimeoutUserTurnStopStrategy(BaseUserTurnStopStrategy):
                 if self._stt_timeout_task:
                     await self.task_manager.cancel_task(self._stt_timeout_task)
                     self._stt_timeout_task = None
+
+            # v1.5 short-utterance short-circuit: when STT has finalized
+            # AND the utterance is short, also collapse the
+            # user_speech_timeout policy floor. Short responses ("ok",
+            # "yes", "haan ji") don't need the full grace window — we can
+            # turn around immediately. Disabled when threshold == 0.
+            if (
+                self._short_utterance_char_threshold > 0
+                and len(self._text) <= self._short_utterance_char_threshold
+                and not self._user_speech_wait_done
+            ):
+                self._user_speech_wait_done = True
+                if self._user_speech_timeout_task:
+                    await self.task_manager.cancel_task(self._user_speech_timeout_task)
+                    self._user_speech_timeout_task = None
 
         # If both waits are already done, the turn was waiting on text —
         # trigger now.

@@ -594,6 +594,14 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._partial_word_start_time = 0.0
         self._alignment_started_context_ids: set[str | None] = set()
 
+        # The multi-stream-input endpoint requires that ``voice_settings`` (and
+        # ``pronunciation_dictionary_locators``) appear only in the FIRST
+        # message of a socket session and then never change — re-sending them on
+        # a later context closes the socket with WS 1008. This guard tracks
+        # whether the current socket has already received them; it is reset on
+        # every (dis)connect so a fresh socket may legally re-send them.
+        self._voice_settings_sent: bool = False
+
         # Context management for v1 multi API
         self._receive_task = None
         self._keepalive_task = None
@@ -652,15 +660,30 @@ class ElevenLabsTTSService(WebsocketTTSService):
             await self._disconnect()
             await self._connect()
         elif voice_settings_changed:
-            logger.debug(
-                f"Voice settings changed ({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS}), "
-                f"closing current context to apply changes"
-            )
-            audio_contexts = self.get_audio_contexts()
-            if audio_contexts:
-                for ctx_id in audio_contexts:
-                    await self._close_context(ctx_id)
-                    self._reset_alignment_state(ctx_id)
+            # On the multi-stream-input endpoint ``voice_settings`` is
+            # connection-scoped: it may only be sent in the first message of a
+            # socket session and may never change on that socket. Closing the
+            # context and re-opening a new one on the SAME socket would re-emit
+            # the changed settings and trip WS 1008. The only safe way to apply
+            # a voice-settings delta mid-call is a full reconnect, which resets
+            # ``_voice_settings_sent`` so the new value legally rides the next
+            # socket's first context-init message.
+            if self._voice_settings_sent and self._websocket:
+                logger.debug(
+                    f"Voice settings changed "
+                    f"({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS}), "
+                    f"reconnecting WebSocket to apply changes"
+                )
+                await self._disconnect()
+                await self._connect()
+            else:
+                # No live socket yet — nothing to reconnect; the rebuilt
+                # ``self._voice_settings`` will be sent on the first context.
+                logger.debug(
+                    f"Voice settings changed "
+                    f"({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS}); "
+                    f"will apply on next connect"
+                )
 
         if not url_changed:
             # Reconnect applies all settings; only warn about fields not handled
@@ -772,6 +795,10 @@ class ElevenLabsTTSService(WebsocketTTSService):
                 url, max_size=16 * 1024 * 1024, additional_headers={"xi-api-key": self._api_key}
             )
 
+            # A fresh socket has not yet received voice settings; the first
+            # context-init message on it must (re)send them.
+            self._voice_settings_sent = False
+
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
@@ -792,6 +819,8 @@ class ElevenLabsTTSService(WebsocketTTSService):
         finally:
             await self.remove_active_audio_context()
             self._websocket = None
+            # The socket is gone; the next socket must re-send voice settings.
+            self._voice_settings_sent = False
             await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
@@ -971,15 +1000,23 @@ class ElevenLabsTTSService(WebsocketTTSService):
                     self._partial_word = ""
                     self._partial_word_start_time = 0.0
 
-                    # Initialize context with voice settings and pronunciation dictionaries
+                    # Initialize context with voice settings and pronunciation
+                    # dictionaries. On the multi-stream-input endpoint these are
+                    # connection-scoped: they may appear only in the first
+                    # message of the socket session and must never be re-sent on
+                    # a later context, or the server closes the socket with WS
+                    # 1008 ("voice_settings field must be provided in the first
+                    # message and then either be not provided or not change").
                     msg: dict[str, Any] = {"text": " ", "context_id": context_id}
-                    if self._voice_settings:
-                        msg["voice_settings"] = self._voice_settings
-                    if self._pronunciation_dictionary_locators:
-                        msg["pronunciation_dictionary_locators"] = [
-                            locator.model_dump()
-                            for locator in self._pronunciation_dictionary_locators
-                        ]
+                    if not self._voice_settings_sent:
+                        if self._voice_settings:
+                            msg["voice_settings"] = self._voice_settings
+                        if self._pronunciation_dictionary_locators:
+                            msg["pronunciation_dictionary_locators"] = [
+                                locator.model_dump()
+                                for locator in self._pronunciation_dictionary_locators
+                            ]
+                        self._voice_settings_sent = True
                     await self._websocket.send(json.dumps(msg))
                     logger.trace(f"Created new context {context_id}")
 

@@ -28,7 +28,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import STTSettings
-from pipecat.services.stt_latency import DOGRAH_TTFS_P99
+from pipecat.services.stt_latency import WTFVOICE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
@@ -46,20 +46,20 @@ except ModuleNotFoundError as e:
 
 
 @dataclass
-class DograhSTTSettings(STTSettings):
+class WTFVoiceSTTSettings(STTSettings):
     """Settings for DograhSTTService."""
 
     pass
 
 
-class DograhSTTService(STTService, WebsocketService):
+class WTFVoiceSTTService(STTService, WebsocketService):
     """Dograh speech-to-text service using WebSocket streaming.
 
     This service provides real-time speech recognition using Dograh's unified WebSocket API.
     Supports streaming transcription, interim results, and VAD events.
     """
 
-    Settings = DograhSTTSettings
+    Settings = WTFVoiceSTTSettings
 
     def __init__(
         self,
@@ -71,8 +71,8 @@ class DograhSTTService(STTService, WebsocketService):
         interim_results: bool = True,
         vad_events: bool = False,
         keyterms: list[str] | None = None,
-        settings: DograhSTTSettings | None = None,
-        ttfs_p99_latency: float | None = DOGRAH_TTFS_P99,
+        settings: WTFVoiceSTTSettings | None = None,
+        ttfs_p99_latency: float | None = WTFVOICE_TTFS_P99,
         **kwargs,
     ):
         """Initialize STT service.
@@ -90,7 +90,7 @@ class DograhSTTService(STTService, WebsocketService):
                 Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to the parent services.
         """
-        default_settings = DograhSTTSettings(model="default", language="multi")
+        default_settings = WTFVoiceSTTSettings(model="default", language="multi")
         if settings is not None:
             default_settings.apply_update(settings)
 

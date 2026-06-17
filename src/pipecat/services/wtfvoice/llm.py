@@ -17,7 +17,7 @@ from pipecat.services.openai.base_llm import OpenAILLMInvocationParams, OpenAILL
 from pipecat.services.openai.llm import OpenAILLMService
 
 
-class DograhLLMService(OpenAILLMService):
+class WTFVoiceLLMService(OpenAILLMService):
     """A unified LLM service using Dograh's API with OpenAI-compatible interface.
 
     This service extends OpenAILLMService to connect to Dograh's unified API endpoint

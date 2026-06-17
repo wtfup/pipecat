@@ -67,7 +67,7 @@ def calculate_word_times(
 
 
 @dataclass
-class DograhTTSSettings(TTSSettings):
+class WTFVoiceTTSSettings(TTSSettings):
     """Settings for DograhTTSService.
 
     Parameters:
@@ -81,7 +81,7 @@ class DograhTTSSettings(TTSSettings):
     volume: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
-class DograhTTSService(WebsocketTTSService):
+class WTFVoiceTTSService(WebsocketTTSService):
     """Dograh WebSocket-based TTS service with word timestamps.
 
     This service provides real-time text-to-speech using Dograh's unified WebSocket API.
@@ -89,7 +89,7 @@ class DograhTTSService(WebsocketTTSService):
     Dograh backend configuration. Supports word-level timestamps and audio streaming.
     """
 
-    Settings = DograhTTSSettings
+    Settings = WTFVoiceTTSSettings
 
     def __init__(
         self,
@@ -98,7 +98,7 @@ class DograhTTSService(WebsocketTTSService):
         base_url: str = "wss://services.dograh.com",
         ws_path: str = "/api/v1/tts/stream",
         sample_rate: int | None = None,
-        settings: DograhTTSSettings | None = None,
+        settings: WTFVoiceTTSSettings | None = None,
         text_aggregation_mode: TextAggregationMode | None = None,
         **kwargs,
     ):
@@ -113,7 +113,7 @@ class DograhTTSService(WebsocketTTSService):
             text_aggregation_mode: How to aggregate incoming text before synthesis.
             **kwargs: Additional arguments passed to the parent service.
         """
-        default_settings = DograhTTSSettings(
+        default_settings = WTFVoiceTTSSettings(
             model="default",
             voice="default",
             language="en",

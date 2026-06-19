@@ -9,7 +9,7 @@
 ElevenLabs' ``multi-stream-input`` endpoint requires ``voice_settings`` to be
 provided in the *first message of the socket session* and then either omitted
 or unchanged. Re-sending ``voice_settings`` on a later context (a new turn)
-closes the socket with WS 1008. Because dograh runs the service with
+closes the socket with WS 1008. Because wtfvoice runs the service with
 ``reconnect_on_error=False``, that kills TTS for the rest of the call — the
 "works for the greeting, dies ~40s in" signature observed on live runs 27/28.
 

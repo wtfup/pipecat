@@ -37,3 +37,4 @@ class RealtimeFeedbackType(Enum):
     BOT_STOPPED_SPEAKING = "rtf-bot-stopped-speaking"
     USER_MUTE_STARTED = "rtf-user-mute-started"
     USER_MUTE_STOPPED = "rtf-user-mute-stopped"
+    AUDIO_DIAGNOSTICS = "rtf-audio-diagnostics"

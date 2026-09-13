@@ -37,6 +37,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 try:
     from azure.cognitiveservices.speech import (
         CancellationReason,
+        PropertyId,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -50,6 +51,17 @@ except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Azure, you need to `pip install pipecat-ai[azure]`.")
     raise Exception(f"Missing module: {e}")
+
+# Fast end-of-utterance segmentation: shorter trailing-silence window before
+# the service declares a `recognized` (final) transcript. Azure's default
+# segmentation waits ~500ms+ of silence; 350ms shaves that off the STT
+# finalization leg of every turn (army audit 2026-09-13, top-5 fix list).
+# Combined with finalized=True on the terminal frame, this is what releases
+# the user turn promptly instead of waiting out user_speech_timeout.
+AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS = 350
+# Post-processing = PostRefinement rewrites only the FINAL transcript and
+# leaves interim hypotheses untouched, so eager/interim consumers stay fast.
+AZURE_POST_PROCESSING_OPTION = "PostRefinement"
 
 
 @dataclass
@@ -154,6 +166,24 @@ class AzureSTTService(STTService):
 
         if endpoint_id:
             self._speech_config.endpoint_id = endpoint_id
+
+        # Fast segmentation + final-only post-refinement (see module-level
+        # constants). Wrapped defensively: a property name not known to the
+        # installed SDK version must never kill the whole STT service.
+        try:
+            self._speech_config.set_property(
+                PropertyId.Speech_SegmentationSilenceTimeoutMs,
+                str(AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS),
+            )
+            self._speech_config.set_property(
+                PropertyId.SpeechServiceResponse_PostProcessingOption,
+                AZURE_POST_PROCESSING_OPTION,
+            )
+        except Exception as exc:  # pragma: no cover - SDK drift guard
+            logger.warning(
+                f"Azure STT: could not set segmentation properties ({exc}); "
+                "falling back to SDK defaults (slower end-of-utterance)."
+            )
 
         self._audio_stream = None
         self._speech_recognizer = None

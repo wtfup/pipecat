@@ -286,12 +286,20 @@ class AzureSTTService(STTService):
                 "Language | None",
                 getattr(event.result, "language", None) or assert_given(self._settings.language),
             )
+            # The service's terminal transcript for this utterance. Mark it
+            # finalized=True so SpeechTimeoutUserTurnStopStrategy can
+            # short-circuit its stt_timeout safety net (and the
+            # short-utterance policy floor) instead of waiting out the full
+            # user_speech_timeout timer -- see the identical Sarvam patch
+            # (fork commit 21a386a8f, sarvam/stt.py) and
+            # speech_timeout_user_turn_stop_strategy.py.
             frame = TranscriptionFrame(
                 event.result.text,
                 self._user_id,
                 time_now_iso8601(),
                 language,
                 result=event,
+                finalized=True,
             )
             asyncio.run_coroutine_threadsafe(
                 self._handle_transcription(event.result.text, True, language), self.get_event_loop()

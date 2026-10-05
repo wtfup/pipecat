@@ -33,6 +33,7 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 try:
     from azure.cognitiveservices.speech import (
         CancellationReason,
+        Connection,
         ResultReason,
         ServicePropertyChannel,
         SpeechConfig,
@@ -341,6 +342,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
 
         self._speech_config = None
         self._speech_synthesizer = None
+        self._connection = None  # Prewarmed synthesis WS connection (see start())
         self._audio_queue = asyncio.Queue()
         self._word_boundary_queue = asyncio.Queue()
         self._word_processor_task = None
@@ -397,6 +399,20 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._speech_synthesizer.synthesis_completed.connect(self._handle_completed)
         self._speech_synthesizer.synthesis_canceled.connect(self._handle_canceled)
         self._speech_synthesizer.synthesis_word_boundary.connect(self._handle_word_boundary)
+
+        # PREWARM the synthesis WebSocket during pipeline start so the FIRST real
+        # utterance (the greeting) is not paying the ~2s TLS+WS+auth handshake
+        # cold-start. The Azure SDK otherwise connects lazily on the first
+        # speak_*_async call. Pre-opening the connection here overlaps that setup
+        # with the rest of pipeline startup. Best-effort: any failure is logged
+        # and swallowed — synthesis will simply connect lazily as before.
+        try:
+            self._connection = Connection.from_speech_synthesizer(
+                self._speech_synthesizer
+            )
+            self._connection.open(True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Azure TTS connection prewarm skipped: {e}")
 
         # Start word processor task
         if not self._word_processor_task:

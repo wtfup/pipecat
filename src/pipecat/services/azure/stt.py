@@ -44,6 +44,15 @@ try:
         SpeechConfig,
         SpeechRecognizer,
     )
+
+    try:  # continuous language identification (optional on older SDKs)
+        from azure.cognitiveservices.speech import (
+            AutoDetectSourceLanguageConfig,
+            AutoDetectSourceLanguageResult,
+        )
+    except ImportError:  # pragma: no cover - SDK drift guard
+        AutoDetectSourceLanguageConfig = None  # type: ignore[assignment]
+        AutoDetectSourceLanguageResult = None  # type: ignore[assignment]
     from azure.cognitiveservices.speech.audio import (
         AudioStreamFormat,
         PushAudioInputStream,
@@ -104,6 +113,7 @@ class AzureSTTService(STTService):
         endpoint_id: str | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = AZURE_TTFS_P99,
+        candidate_languages: list[str] | None = None,
         **kwargs,
     ):
         """Initialize the Azure STT service.
@@ -160,6 +170,18 @@ class AzureSTTService(STTService):
         # The input is band-limited telephony audio, so quick cubic
         # interpolation loses nothing the recognizer can use.
         self._upsampler: "soxr.ResampleStream | None" = None
+        # CONTINUOUS LANGUAGE IDENTIFICATION (28-10-2026). Indian callers switch
+        # between Hindi and English inside one call; a single-locale recognizer
+        # (hi-IN) writes the English in Devanagari ("टेल मी व्हाट इज़ इट अबाउट"),
+        # which the LLM then reads as Hindi. With two or more BCP-47 candidates
+        # the recognizer runs Azure's continuous LID instead and reports the
+        # detected language on every result. One candidate (or none) keeps the
+        # single-locale behaviour byte-for-byte.
+        cleaned = [c.strip() for c in (candidate_languages or []) if isinstance(c, str) and c.strip()]
+        if len(cleaned) >= 2 and AutoDetectSourceLanguageConfig is None:
+            logger.warning("Azure STT: this SDK has no AutoDetectSourceLanguageConfig; continuous LID is off")
+            cleaned = []
+        self._candidate_languages: list[str] = cleaned if len(cleaned) >= 2 else []
 
         recognition_language = assert_given(
             default_settings.language
@@ -334,9 +356,27 @@ class AzureSTTService(STTService):
 
             audio_config = AudioConfig(stream=self._audio_stream)
 
-            self._speech_recognizer = SpeechRecognizer(
-                speech_config=self._speech_config, audio_config=audio_config
-            )
+            if self._candidate_languages:
+                try:
+                    self._speech_config.set_property(
+                        PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous"
+                    )
+                except Exception as exc:  # pragma: no cover - SDK drift guard
+                    logger.warning(f"Azure STT: could not set continuous LID mode ({exc})")
+                logger.info(
+                    f"Azure STT: continuous language identification over {self._candidate_languages}"
+                )
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config,
+                    auto_detect_source_language_config=AutoDetectSourceLanguageConfig(
+                        languages=list(self._candidate_languages)
+                    ),
+                    audio_config=audio_config,
+                )
+            else:
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config, audio_config=audio_config
+                )
             self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
             self._speech_recognizer.recognized.connect(self._on_handle_recognized)
             self._speech_recognizer.canceled.connect(self._on_handle_canceled)
@@ -364,13 +404,25 @@ class AzureSTTService(STTService):
         """Handle a transcription result with tracing."""
         await self.stop_processing_metrics()
 
+    def _detected_language(self, result) -> str | None:
+        """The language continuous LID attached to a result, or None when LID is off / absent."""
+        if not self._candidate_languages or AutoDetectSourceLanguageResult is None:
+            return None
+        try:
+            detected = AutoDetectSourceLanguageResult(result).language
+        except Exception:  # pragma: no cover - SDK drift guard
+            return None
+        return detected or None
+
     def _on_handle_recognized(self, event):
         if event.result.reason == ResultReason.RecognizedSpeech and len(event.result.text) > 0:
             # Technically either source could be a raw string, but Language is
             # a StrEnum so downstream handles either.
             language = cast(
                 "Language | None",
-                getattr(event.result, "language", None) or assert_given(self._settings.language),
+                self._detected_language(event.result)
+                or getattr(event.result, "language", None)
+                or assert_given(self._settings.language),
             )
             # The service's terminal transcript for this utterance. Mark it
             # finalized=True so SpeechTimeoutUserTurnStopStrategy can

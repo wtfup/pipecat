@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from loguru import logger
+import numpy as np
+import soxr
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -62,6 +64,15 @@ AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS = 350
 # Post-processing = PostRefinement rewrites only the FINAL transcript and
 # leaves interim hypotheses untouched, so eager/interim consumers stay fast.
 AZURE_POST_PROCESSING_OPTION = "PostRefinement"
+# Azure's streaming recognizer stopped accepting 8 kHz push streams on
+# 2026-10-23 (every telephony call on the platform died at answer with
+# ``Error code: 1007 ... Named streaming recognition requires 16-kHz mono
+# 16-bit PCM``; wtf-voice run 1384 is the first, 1533 the one that was heard).
+# Telephony transports (IVR Solutions, Plivo, Telnyx, ARI) deliver 8 kHz, so
+# the service now declares a 16 kHz push stream and upsamples what it is fed
+# whenever the pipeline rate is below that. Rates at or above 16 kHz pass
+# through untouched.
+AZURE_MIN_STREAM_SAMPLE_RATE = 16000
 
 
 @dataclass
@@ -139,6 +150,16 @@ class AzureSTTService(STTService):
             settings=default_settings,
             **kwargs,
         )
+
+        # The rate the Azure push stream is declared at; fixed in _connect once
+        # the pipeline rate is known. Below 16 kHz the input is upsampled.
+        self._azure_stream_sample_rate: int | None = None
+        # A stateful soxr stream in "QQ" quality: continuous across 20 ms chunks
+        # with no start-up latency (the VHQ stream resampler buffers ~100 ms and
+        # returns empty chunks, which would delay every caller's first words).
+        # The input is band-limited telephony audio, so quick cubic
+        # interpolation loses nothing the recognizer can use.
+        self._upsampler: "soxr.ResampleStream | None" = None
 
         recognition_language = assert_given(
             default_settings.language
@@ -236,10 +257,35 @@ class AzureSTTService(STTService):
         try:
             await self.start_processing_metrics()
             if self._audio_stream:
-                self._audio_stream.write(audio)
+                data = await self._audio_for_azure(audio)
+                # The stream resampler holds a few milliseconds of filter history, so the
+                # first chunk can come back empty; never hand Azure an empty buffer.
+                if data:
+                    self._audio_stream.write(data)
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
+
+    @staticmethod
+    def azure_stream_sample_rate_for(pipeline_rate: int) -> int:
+        """The rate to declare to Azure for a given pipeline rate (never below 16 kHz)."""
+        return max(int(pipeline_rate or 0), AZURE_MIN_STREAM_SAMPLE_RATE)
+
+    async def _audio_for_azure(self, audio: bytes) -> bytes:
+        """Upsample pipeline audio to the declared Azure stream rate when they differ."""
+        target = self._azure_stream_sample_rate
+        if target is None or not audio or target == self.sample_rate:
+            return audio
+        if self._upsampler is None:
+            self._upsampler = soxr.ResampleStream(
+                in_rate=self.sample_rate,
+                out_rate=target,
+                num_channels=1,
+                dtype="int16",
+                quality="QQ",
+            )
+        samples = np.frombuffer(audio, dtype=np.int16)
+        return self._upsampler.resample_chunk(samples).tobytes()
 
     async def start(self, frame: StartFrame):
         """Start the speech recognition service.
@@ -274,7 +320,16 @@ class AzureSTTService(STTService):
             return
 
         try:
-            stream_format = AudioStreamFormat(samples_per_second=self.sample_rate, channels=1)
+            self._azure_stream_sample_rate = self.azure_stream_sample_rate_for(self.sample_rate)
+            if self._azure_stream_sample_rate != self.sample_rate:
+                logger.info(
+                    f"Azure STT: pipeline audio is {self.sample_rate} Hz; declaring a "
+                    f"{self._azure_stream_sample_rate} Hz push stream and upsampling "
+                    "(Azure rejects sub-16 kHz streaming since 2026-10-23)."
+                )
+            stream_format = AudioStreamFormat(
+                samples_per_second=self._azure_stream_sample_rate, channels=1
+            )
             self._audio_stream = PushAudioInputStream(stream_format)
 
             audio_config = AudioConfig(stream=self._audio_stream)
@@ -300,6 +355,7 @@ class AzureSTTService(STTService):
         if self._audio_stream:
             self._audio_stream.close()
             self._audio_stream = None
+        self._upsampler = None
 
     @traced_stt
     async def _handle_transcription(

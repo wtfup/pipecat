@@ -81,6 +81,7 @@ from pipecat.turns.user_mute import (
 )
 from pipecat.turns.user_start import (
     ExternalUserTurnStartStrategy,
+    ProvisionalVADUserTurnStartStrategy,
     TranscriptionUserTurnStartStrategy,
     VADUserTurnStartStrategy,
 )
@@ -481,7 +482,7 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             context,
             params=LLMUserAggregatorParams(
                 user_turn_strategies=UserTurnStrategies(
-                    start=[TranscriptionUserTurnStartStrategy()],
+                    start=[ProvisionalVADUserTurnStartStrategy()],
                     stop=[ExternalUserTurnStopStrategy(timeout=30.0)],
                 ),
                 user_turn_stop_timeout=30.0,
@@ -493,8 +494,8 @@ class TestLLMUserAggregator(unittest.IsolatedAsyncioTestCase):
             SleepFrame(sleep=0.3),
         ]
         expected_down_frames = [
-            # A transcript-gated start strategy does not resolve proposed turn
-            # starts, so the aggregator forwards the proposal down the pipeline.
+            # ProvisionalVAD does not resolve proposed turn starts, so the
+            # aggregator forwards the proposal on down the pipeline.
             ProposedUserStartedSpeakingFrame,
             UserStartedSpeakingFrame,
             InterruptionFrame,

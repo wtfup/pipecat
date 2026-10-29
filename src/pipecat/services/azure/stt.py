@@ -15,6 +15,8 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
+import numpy as np
+import soxr
 from loguru import logger
 
 from pipecat.frames.frames import (
@@ -44,6 +46,15 @@ try:
         SpeechConfig,
         SpeechRecognizer,
     )
+
+    try:  # continuous language identification (optional on older SDKs)
+        from azure.cognitiveservices.speech import (
+            AutoDetectSourceLanguageConfig,
+            AutoDetectSourceLanguageResult,
+        )
+    except ImportError:  # pragma: no cover - SDK drift guard
+        AutoDetectSourceLanguageConfig = None  # type: ignore[assignment,misc]
+        AutoDetectSourceLanguageResult = None  # type: ignore[assignment,misc]
     from azure.cognitiveservices.speech.audio import (
         AudioStreamFormat,
         PushAudioInputStream,
@@ -54,6 +65,24 @@ except ModuleNotFoundError as e:
     logger.error('In order to use Azure, you need to `uv add "pipecat-ai[azure]"`.')
     raise ImportError(f"Missing module: {e}") from e
 
+
+# WTF fork: fast end-of-utterance segmentation. Azure's default trailing-silence
+# window is ~500 ms; 350 ms shaves that off the STT finalization leg of every
+# turn (army audit 2026-09-13, top-5 fix list). Upstream 1.12 exposes this as the
+# ``segmentation_silence_timeout_ms`` setting with default ``None``; the fork
+# defaults it to 350 so callers keep today's latency. Pass ``None`` explicitly in
+# settings to fall back to Azure's default.
+AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS = 350
+# WTF fork: post-processing = PostRefinement rewrites only the FINAL transcript
+# and leaves interim hypotheses untouched, so interim consumers stay fast.
+AZURE_POST_PROCESSING_OPTION = "PostRefinement"
+# WTF fork: Azure's streaming recognizer stopped accepting 8 kHz push streams on
+# 2026-10-23 (every telephony call died at answer with ``Error code: 1007 ...
+# Named streaming recognition requires 16-kHz mono 16-bit PCM``; wtf-voice runs
+# 1384-1533). Telephony transports (IVR Solutions, Plivo, Telnyx, ARI) deliver
+# 8 kHz, so the service declares a 16 kHz push stream and upsamples whenever the
+# pipeline rate is below that. Rates at or above 16 kHz pass through untouched.
+AZURE_MIN_STREAM_SAMPLE_RATE = 16000
 
 AzureProfanity = Literal["raw", "masked", "removed"]
 """How Azure handles profanity in transcripts.
@@ -124,6 +153,7 @@ class AzureSTTService(STTService):
         endpoint_id: str | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = AZURE_TTFS_P99,
+        candidate_languages: list[str] | None = None,
         **kwargs,
     ):
         """Initialize the Azure STT service.
@@ -146,6 +176,10 @@ class AzureSTTService(STTService):
                 parameters, ``settings`` values take precedence.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
                 Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
+            candidate_languages: WTF fork. Two or more BCP-47 locales switch the
+                recognizer to Azure continuous language identification; each
+                result then carries its detected language. One or none keeps the
+                single-locale recognizer.
             **kwargs: Additional arguments passed to parent STTService.
         """
         # 1. Initialize default_settings with hardcoded defaults
@@ -153,7 +187,7 @@ class AzureSTTService(STTService):
             model=None,
             language=Language.EN_US,
             profanity=None,
-            segmentation_silence_timeout_ms=None,
+            segmentation_silence_timeout_ms=AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -173,6 +207,30 @@ class AzureSTTService(STTService):
             settings=default_settings,
             **kwargs,
         )
+
+        # WTF fork: the rate the Azure push stream is declared at; fixed in
+        # _connect once the pipeline rate is known. Below 16 kHz the input is
+        # upsampled through a stateful soxr stream in "QQ" quality: continuous
+        # across 20 ms chunks with no start-up latency (the VHQ stream resampler
+        # buffers ~100 ms and returns empty chunks, which would delay every
+        # caller's first words). Telephony audio is band-limited, so quick cubic
+        # interpolation loses nothing the recognizer can use.
+        self._azure_stream_sample_rate: int | None = None
+        self._upsampler: "soxr.ResampleStream | None" = None
+
+        # WTF fork: continuous language identification (2026-10-28). Indian
+        # callers switch between Hindi and English inside one call; a single
+        # hi-IN recognizer writes the English in Devanagari, which the LLM then
+        # reads as Hindi.
+        cleaned = [
+            c.strip() for c in (candidate_languages or []) if isinstance(c, str) and c.strip()
+        ]
+        if len(cleaned) >= 2 and AutoDetectSourceLanguageConfig is None:
+            logger.warning(
+                "Azure STT: this SDK has no AutoDetectSourceLanguageConfig; continuous LID is off"
+            )
+            cleaned = []
+        self._candidate_languages: list[str] = cleaned if len(cleaned) >= 2 else []
 
         recognition_language = assert_given(
             default_settings.language
@@ -203,6 +261,7 @@ class AzureSTTService(STTService):
 
         self._apply_profanity()
         self._apply_segmentation_silence_timeout()
+        self._apply_post_processing()
 
         self._audio_stream = None
         self._speech_recognizer = None
@@ -250,6 +309,37 @@ class AzureSTTService(STTService):
                 PropertyId.Speech_SegmentationSilenceTimeoutMs, str(timeout_ms)
             )
 
+    def _apply_post_processing(self):
+        """WTF fork: final-only post-refinement (defensive against SDK drift)."""
+        try:
+            self._speech_config.set_property(
+                PropertyId.SpeechServiceResponse_PostProcessingOption,
+                AZURE_POST_PROCESSING_OPTION,
+            )
+        except Exception as exc:  # pragma: no cover - SDK drift guard
+            logger.warning(f"Azure STT: could not set post-processing option ({exc})")
+
+    @staticmethod
+    def azure_stream_sample_rate_for(pipeline_rate: int) -> int:
+        """The rate to declare to Azure for a given pipeline rate (never below 16 kHz)."""
+        return max(int(pipeline_rate or 0), AZURE_MIN_STREAM_SAMPLE_RATE)
+
+    def _audio_for_azure(self, audio: bytes) -> bytes:
+        """Upsample pipeline audio to the declared Azure stream rate when they differ."""
+        target = self._azure_stream_sample_rate
+        if target is None or not audio or target == self.sample_rate:
+            return audio
+        if self._upsampler is None:
+            self._upsampler = soxr.ResampleStream(
+                in_rate=self.sample_rate,
+                out_rate=target,
+                num_channels=1,
+                dtype="int16",
+                quality="QQ",
+            )
+        samples = np.frombuffer(audio, dtype=np.int16)
+        return self._upsampler.resample_chunk(samples).tobytes()
+
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
         """Apply a settings delta and reconnect if a recognizer setting changed."""
         changed = await super()._update_settings(delta)
@@ -295,7 +385,11 @@ class AzureSTTService(STTService):
         """
         try:
             if self._audio_stream:
-                self._audio_stream.write(audio)
+                data = self._audio_for_azure(audio)
+                # The stream resampler holds a few samples of filter history, so
+                # a chunk can come back empty; never hand Azure an empty buffer.
+                if data:
+                    self._audio_stream.write(data)
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
@@ -338,14 +432,42 @@ class AzureSTTService(STTService):
             return
 
         try:
-            stream_format = AudioStreamFormat(samples_per_second=self.sample_rate, channels=1)
+            self._azure_stream_sample_rate = self.azure_stream_sample_rate_for(self.sample_rate)
+            self._upsampler = None
+            if self._azure_stream_sample_rate != self.sample_rate:
+                logger.info(
+                    f"Azure STT: pipeline audio is {self.sample_rate} Hz; declaring a "
+                    f"{self._azure_stream_sample_rate} Hz push stream and upsampling "
+                    "(Azure rejects sub-16 kHz streaming since 2026-10-23)."
+                )
+            stream_format = AudioStreamFormat(
+                samples_per_second=self._azure_stream_sample_rate, channels=1
+            )
             self._audio_stream = PushAudioInputStream(stream_format)
 
             audio_config = AudioConfig(stream=self._audio_stream)
 
-            self._speech_recognizer = SpeechRecognizer(
-                speech_config=self._speech_config, audio_config=audio_config
-            )
+            if self._candidate_languages:
+                try:
+                    self._speech_config.set_property(
+                        PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous"
+                    )
+                except Exception as exc:  # pragma: no cover - SDK drift guard
+                    logger.warning(f"Azure STT: could not set continuous LID mode ({exc})")
+                logger.info(
+                    f"Azure STT: continuous language identification over {self._candidate_languages}"
+                )
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config,
+                    auto_detect_source_language_config=AutoDetectSourceLanguageConfig(
+                        languages=list(self._candidate_languages)
+                    ),
+                    audio_config=audio_config,
+                )
+            else:
+                self._speech_recognizer = SpeechRecognizer(
+                    speech_config=self._speech_config, audio_config=audio_config
+                )
             self._speech_recognizer.recognizing.connect(self._on_handle_recognizing)
             self._speech_recognizer.recognized.connect(self._on_handle_recognized)
             self._speech_recognizer.canceled.connect(self._on_handle_canceled)
@@ -364,6 +486,7 @@ class AzureSTTService(STTService):
         if self._audio_stream:
             self._audio_stream.close()
             self._audio_stream = None
+        self._upsampler = None
 
     @traced_stt
     async def _handle_transcription(
@@ -372,13 +495,25 @@ class AzureSTTService(STTService):
         """Handle a transcription result with tracing."""
         pass
 
+    def _detected_language(self, result) -> str | None:
+        """The language continuous LID attached to a result, or None when LID is off/absent."""
+        if not self._candidate_languages or AutoDetectSourceLanguageResult is None:
+            return None
+        try:
+            detected = AutoDetectSourceLanguageResult(result).language
+        except Exception:  # pragma: no cover - SDK drift guard
+            return None
+        return detected or None
+
     def _on_handle_recognized(self, event):
         if event.result.reason == ResultReason.RecognizedSpeech and len(event.result.text) > 0:
             # Technically either source could be a raw string, but Language is
             # a StrEnum so downstream handles either.
             language = cast(
                 "Language | None",
-                getattr(event.result, "language", None) or assert_given(self._settings.language),
+                self._detected_language(event.result)
+                or getattr(event.result, "language", None)
+                or assert_given(self._settings.language),
             )
             # Azure's ``RecognizedSpeech`` event is by definition the final
             # recognition for an utterance — mark the frame as such so that

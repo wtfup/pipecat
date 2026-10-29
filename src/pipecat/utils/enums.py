@@ -17,6 +17,17 @@ class EndTaskReason(Enum):
     TRANSFER_CALL = "transfer_call"
     PIPELINE_ERROR = "pipeline_error"
 
+    # WTF fork: dispositions that Dograh removed in 2c00dc24d ("clean up
+    # deprecated dispositions"). WTF Voice still emits them and stores their
+    # values on workflow runs (call_status / disposition); reports, the failure
+    # taxonomy and the UI disposition codes key on these exact strings. The
+    # values must never change.
+    END_CALL_TOOL_REASON = "end_call_tool"
+    USER_QUALIFIED = "user_qualified"
+    USER_DISQUALIFIED = "user_disqualified"
+    SYSTEM_CONNECT_ERROR = "system_connect_error"
+    UNKNOWN = "unknown"
+
 
 class RealtimeFeedbackType(Enum):
     """Message types for real-time feedback events."""

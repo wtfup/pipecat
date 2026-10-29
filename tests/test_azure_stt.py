@@ -88,9 +88,23 @@ class TestAzureSTTSegmentationSilenceTimeout(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0].args[1], "1200")
 
-    def test_timeout_omitted_is_no_op(self):
+    def test_timeout_omitted_uses_fork_default_350ms(self):
+        # WTF fork: omitted = 350 ms (AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS),
+        # not Azure's 500 ms, so the caller-heard end-of-turn latency matches
+        # what production ran on 1.1 (fork commit 1e8b751b4).
         with patch("pipecat.services.azure.stt.SpeechConfig.set_property") as mock_set:
             AzureSTTService(api_key="fake", region="eastus")
+            calls = self._segmentation_calls(mock_set)
+            self.assertEqual([c.args[1] for c in calls], ["350"])
+
+    def test_timeout_explicit_none_is_no_op(self):
+        # Explicit None keeps Azure's own default (the upstream behaviour).
+        with patch("pipecat.services.azure.stt.SpeechConfig.set_property") as mock_set:
+            AzureSTTService(
+                api_key="fake",
+                region="eastus",
+                settings=AzureSTTService.Settings(segmentation_silence_timeout_ms=None),
+            )
             self.assertEqual(self._segmentation_calls(mock_set), [])
 
 

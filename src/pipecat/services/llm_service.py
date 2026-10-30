@@ -370,6 +370,13 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         self._run_in_parallel = run_in_parallel
         self._group_parallel_tools = group_parallel_tools
         self._pending_node_transition_function_calls: list[FunctionCallFromLLM] = []
+        # WTF fork: opt-in 1.1 tool-call timing. When True, the ordinary
+        # (non-transition) function calls of a response that produced speech
+        # wait for BotStoppedSpeakingFrame, interrupted or not, and are dropped
+        # if a new completion starts first, as on the Dograh 1.1 fork. Off by
+        # default (upstream timing: only a lone node transition waits).
+        self.defer_function_calls_until_bot_stops: bool = False
+        self._deferred_ordinary_function_calls: list[FunctionCallFromLLM] = []
         self._tool_response_interrupted = False
         self._tool_response_playback_stopped = False
         self._tool_response_generation = 0
@@ -778,6 +785,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         elif isinstance(frame, (CancelFrame, EndFrame, StopFrame)):
             self._tool_response_interrupted = True
             self._discard_pending_node_transition_calls(type(frame).__name__)
+            self._discard_deferred_ordinary_calls(type(frame).__name__)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._tool_response_playback_stopped = False
         await super().process_frame(frame, direction)
@@ -1643,6 +1651,7 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
 
     def _begin_tool_response(self) -> int:
         self._discard_pending_node_transition_calls("new_context")
+        self._discard_deferred_ordinary_calls("new_context")
         self._tool_response_interrupted = False
         self._tool_response_playback_stopped = False
         self._tool_response_generation += 1
@@ -1673,6 +1682,20 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
                 f"[{call.tool_call_id}]: {reason}"
             )
 
+    def _discard_deferred_ordinary_calls(self, reason: str) -> None:
+        calls, self._deferred_ordinary_function_calls = self._deferred_ordinary_function_calls, []
+        for call in calls:
+            logger.info(
+                f"{self}: dropping deferred function call {call.function_name} "
+                f"[{call.tool_call_id}]: {reason}"
+            )
+
+    async def _run_deferred_ordinary_calls(self) -> None:
+        calls, self._deferred_ordinary_function_calls = self._deferred_ordinary_function_calls, []
+        if calls:
+            logger.debug(f"{self}: running {len(calls)} deferred function calls after TTS")
+            await self.run_function_calls(calls)
+
     async def _run_or_defer_function_calls(
         self,
         function_calls: list[FunctionCallFromLLM],
@@ -1684,6 +1707,27 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
         if self._speculation_gate.is_speculating:
             await self.run_function_calls(function_calls)
             return
+        if (
+            self.defer_function_calls_until_bot_stops
+            and text_generated
+            and not self._skip_tts
+            and not self._tool_response_playback_stopped
+            and function_calls
+        ):
+            # WTF fork (1.1 timing): park the ordinary calls until playback
+            # stops; registered transitions continue through the upstream rules.
+            ordinary = [
+                c for c in function_calls if not self._function_is_node_transition(c.function_name)
+            ]
+            transitions = [
+                c for c in function_calls if self._function_is_node_transition(c.function_name)
+            ]
+            if ordinary:
+                self._deferred_ordinary_function_calls.extend(ordinary)
+                logger.debug(f"{self}: Deferring {len(ordinary)} function calls until after TTS")
+            if not transitions:
+                return
+            function_calls = transitions
         stale_response = (
             response_generation is not None
             and response_generation != self._tool_response_generation
@@ -1717,6 +1761,10 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
     async def _run_pending_node_transition_function_calls(
         self, frame: BotStoppedSpeakingFrame | None = None
     ) -> None:
+        # WTF fork: ordinary calls parked by defer_function_calls_until_bot_stops
+        # run at any playback stop, interrupted or not (1.1 behaviour).
+        if frame is not None:
+            await self._run_deferred_ordinary_calls()
         if frame is not None and frame.interrupted:
             self._interrupt_tool_response(frame)
             return
